@@ -1,0 +1,46 @@
+-- Таблица для изображений
+CREATE TABLE "public"."images" (
+  "image_id" serial,
+  "image_link" varchar(255), -- Использовать varchar
+  PRIMARY KEY ("image_id")
+);
+
+-- Таблица для пользовательских данных
+CREATE TABLE "public"."user_data" (
+  "user_id" serial,
+  "user_name" varchar(40) NOT NULL,
+  "user_second_name" varchar(40) NOT NULL,
+  "user_patronomyc" varchar(40),
+  "user_gender" bool,
+  "user_age" int2,
+  PRIMARY KEY ("user_id")
+);
+
+-- Таблица результатов обследования
+CREATE TABLE "public"."examination_results" (
+  "examination_id" serial,
+  "examination_result_model" char(1) NOT NULL, 
+  "examination_result_human" char(1) NOT NULL,
+  "examination_location" varchar(2),            
+  "examination_date" date,
+  "examination_doctor" varchar(50) NOT NULL,    
+  "examination_image_id" int4 NOT NULL,
+  "model_confidence" decimal(10,3) NOT NULL,
+  "user_id" int4 NOT NULL,                      -- Внешний ключ к user_data
+  PRIMARY KEY ("examination_id"),
+  UNIQUE ("examination_image_id")
+);
+-- Добавление внешних ключей
+
+-- Связь с изображениями: examination_results -> images
+ALTER TABLE "public"."examination_results" 
+ADD CONSTRAINT "fk_examination_results_images" 
+FOREIGN KEY ("examination_image_id") 
+REFERENCES "public"."images" ("image_id");
+
+-- Связь с пользователями: examination_results -> user_data
+ALTER TABLE "public"."examination_results" 
+ADD CONSTRAINT "fk_examination_results_user" 
+FOREIGN KEY ("user_id") 
+REFERENCES "public"."user_data" ("user_id") 
+ON DELETE RESTRICT ON UPDATE CASCADE; -- Изменено: user_id является FK здесь
