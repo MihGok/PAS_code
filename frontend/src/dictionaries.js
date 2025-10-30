@@ -1,6 +1,3 @@
-// src/dictionaries.js (без изменений, как в предыдущем ответе)
-
-// --- Словарь: Код -> Полное название (для отображения) ---
 export const diseaseMap = {
     'BKL': 'Доброкачественные кератозоподобные поражения', // Benign Keratosis-like lesions
     'AK': 'Актинический кератоз',                        // Actinic Keratoses

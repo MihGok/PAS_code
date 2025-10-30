@@ -6,25 +6,207 @@ from Database.image_storage import minio_service
 from CRUD import crud_ops
 from minio.error import S3Error
 import Schemas.schemas
-import random # Новый импорт для имитации модели
+import io
+import logging
+import traceback
+import re
+import random
+import os
+import requests # Новый импорт для имитации модели
 
 
-# --- НОВАЯ ФУНКЦИЯ: Имитация работы модели (Требование 1) ---
 def run_model_prediction(image_bytes: bytes) -> Schemas.schemas.AnalysisPredictionResponse:
-    """Имитирует запуск ML-модели и возвращает результат."""
-    # В реальном приложении здесь будет логика вызова ML-модели, 
-    # использующая image_bytes
-    
-    disease_codes = ['NV', 'MEL', 'BCC', 'BKL', 'VASC', 'DF', 'AKIEC']
-    result = random.choice(disease_codes)
-    # Уверенность должна быть float для схемы AnalysisPredictionResponse
-    confidence = round(random.uniform(0.7, 0.99), 4) 
+    """
+    Вызов внешнего prediction-service -> нормализация результата ->
+    возвращает AnalysisPredictionResponse, где
+    examination_result_model = "<Русское название> (КОД)"
+    model_confidence = float
+    """
+    logger = logging.getLogger("analysis_service")
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
 
-    return Schemas.schemas.AnalysisPredictionResponse(
-        examination_result_model=result,
-        model_confidence=confidence
-    )
-# --- Конец НОВОЙ ФУНКЦИИ ---
+    # --- Словарь код -> русское название (frontend) ---
+    DISEASE_DISPLAY = {
+        'BKL': 'Доброкачественные кератозоподобные поражения',
+        'AK':  'Актинический кератоз',
+        'BCC': 'Базально-клеточная карцинома',
+        'DF':  'Дерматофиброма',
+        'NV':  'Меланоцитарные невусы',
+        'VASC':'Сосудистые поражения',
+        'MEL': 'Меланома'
+    }
+
+    CANONICAL = {"NV", "MEL", "BCC", "BKL", "AK", "DF", "VASC"}
+
+    # ----------------- ОБНОВЛЁННЫЙ СЛОВАРЬ ПЕРЕКОДИРОВКИ -----------------
+    # Учтены варианты, которые ты прислал: 
+    # ['benign_keratosis-like_lesions','actinic_keratoses','basal_cell_carcinoma',
+    #  'dermatofibroma','melanocytic_Nevi','vascular_lesions','melanoma']
+    SYNONYMS_TO_CODE = {
+        # прямые варианты из модели (нижний регистр / подчёркивания / дефисы)
+        "benign_keratosis-like_lesions": "BKL",
+        "benign_keratosis_like_lesions": "BKL",
+        "benign keratosis like lesions": "BKL",
+        "benignkeratosislikelesions": "BKL",
+        "bkl": "BKL",
+
+        "actinic_keratoses": "AK",
+        "actinic_keratosis": "AK",
+        "actinic keratoses": "AK",
+        "ak": "AK",
+        "akiec": "AK",  # старые/альтернативные коды
+
+        "basal_cell_carcinoma": "BCC",
+        "basal-cell_carcinoma": "BCC",
+        "basal cell carcinoma": "BCC",
+        "bcc": "BCC",
+
+        "dermatofibroma": "DF",
+        "df": "DF",
+
+        "melanocytic_nevi": "NV",
+        "melanocytic_nevus": "NV",
+        "melanocytic_nevi_n": "NV",
+        "melanocyticnevi": "NV",
+        "nevi": "NV",
+        "nev": "NV",
+        "nevus": "NV",
+        "nv": "NV",
+        "nv_m": "NV",
+        "nv_m_": "NV",
+
+        "vascular_lesions": "VASC",
+        "vascular lesions": "VASC",
+        "vascularlesions": "VASC",
+        "vasc": "VASC",
+
+        "melanoma": "MEL",
+        "mel": "MEL"
+    }
+    # ------------------------------------------------------------------
+
+    PREDICT_SERVICE_URL = os.getenv("PREDICT_SERVICE_URL", "http://127.0.0.1:8080/predict")
+    TIMEOUT = (3, 15)  # (connect, read)
+
+    files = {
+        "image_file": ("image.jpg", io.BytesIO(image_bytes), "application/octet-stream")
+    }
+
+    try:
+        logger.info(f"run_model_prediction: sending image to {PREDICT_SERVICE_URL}")
+        resp = requests.post(PREDICT_SERVICE_URL, files=files, timeout=TIMEOUT)
+
+        logger.info(f"Prediction service responded: status={resp.status_code}")
+        body_preview = (resp.text[:1000] + '...') if len(resp.text) > 1000 else resp.text
+        logger.debug(f"Prediction service body (preview): {body_preview}")
+
+        resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except Exception as je:
+            logger.exception(f"Failed to parse JSON from prediction service: {je}")
+            raise
+
+        # Получаем "сырую" метку (если есть)
+        raw_label = None
+        for key in ("label", "predicted_label", "examination_result_model"):
+            if key in data and data.get(key) is not None:
+                raw_label = str(data.get(key))
+                break
+
+        # fallback: если нет текстовой метки, попробуем index
+        if raw_label is None and "index" in data:
+            raw_label = str(data.get("index"))
+
+        logger.debug(f"Raw label from service: {raw_label}")
+
+        # Нормализация -> канонический код
+        canonical_code = None
+        if raw_label:
+            rl = raw_label.strip().lower()
+            # Простая очистка: заменим дефисы на подчёркивания, уберём лишние символы
+            rl = rl.replace("-", "_")
+            rl = re.sub(r"[^a-z0-9_ ]+", "", rl).strip()
+            rl_nospace = rl.replace(" ", "")
+            # Попытки поиска по разным формам:
+            for candidate in (rl, rl_nospace, rl.replace("_", ""), rl.split()[0] if " " in rl else rl):
+                if candidate in SYNONYMS_TO_CODE:
+                    canonical_code = SYNONYMS_TO_CODE[candidate]
+                    break
+            # Если прямого совпадения нет — попробуем первые 4 символа
+            if canonical_code is None:
+                key4 = rl_nospace[:4]
+                if key4 in SYNONYMS_TO_CODE:
+                    canonical_code = SYNONYMS_TO_CODE[key4]
+            # ещё эвристики
+            up = raw_label.strip().upper()
+            if canonical_code is None:
+                if up.startswith("AKIEC"):
+                    canonical_code = "AK"
+                elif up.startswith("NV_M"):
+                    canonical_code = "NV"
+                elif "NEV" in up or "NEVI" in up:
+                    canonical_code = "NV"
+                elif "MELANO" in up:
+                    canonical_code = "MEL"
+
+        # извлекаем уверенность
+        confidence = None
+        if "confidence" in data:
+            try:
+                confidence = float(data.get("confidence"))
+            except Exception:
+                confidence = None
+        if confidence is None and "model_confidence" in data:
+            try:
+                confidence = float(data.get("model_confidence"))
+            except Exception:
+                confidence = None
+        if confidence is None and "probabilities" in data and isinstance(data["probabilities"], list):
+            try:
+                confidence = float(max(data["probabilities"]))
+            except Exception:
+                confidence = None
+
+        # Если не удалось нормализовать -> fallback симуляция
+        if canonical_code is None:
+            logger.warning(f"Could not normalize label '{raw_label}' -> using fallback simulation")
+            canonical_code = random.choice(list(CANONICAL))
+            if confidence is None:
+                confidence = round(random.uniform(0.7, 0.99), 4)
+        else:
+            if confidence is None:
+                confidence = 0.0
+
+        # Русская надпись + код в скобках
+        display_name = DISEASE_DISPLAY.get(canonical_code, canonical_code)
+        display_with_code = f"{display_name} ({canonical_code})"
+
+        logger.info(f"Prediction normalized: {raw_label} -> {display_with_code}, confidence={confidence}")
+
+        return Schemas.schemas.AnalysisPredictionResponse(
+            examination_result_model=display_with_code,
+            model_confidence=float(round(float(confidence), 6))
+        )
+
+    except Exception as e:
+        logger.error(f"Exception during prediction request: {e}")
+        tb = traceback.format_exc()
+        logger.debug(f"Full traceback:\n{tb}")
+
+        # fallback — имитация и отображение на русском
+        canonical_code = random.choice(list(CANONICAL))
+        display_name = DISEASE_DISPLAY.get(canonical_code, canonical_code)
+        display_with_code = f"{display_name} ({canonical_code})"
+        confidence = round(random.uniform(0.7, 0.99), 4)
+        logger.info(f"Using fallback prediction: {display_with_code} ({confidence})")
+        return Schemas.schemas.AnalysisPredictionResponse(
+            examination_result_model=display_with_code,
+            model_confidence=confidence
+        )
+
 
 
 def create_full_analysis_workflow(

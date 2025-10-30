@@ -1,115 +1,102 @@
+# main.py — prediction service entrypoint
 import os
-import random
 import io
-from minio import Minio
-from minio.error import S3Error
+from pathlib import Path
+from typing import List
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 from PIL import Image
 
-# --- Настройки MinIO ---
-MINIO_ENDPOINT = "localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin123"
-MINIO_SECURE = False
-BUCKET_NAME = "images"
+load_dotenv()
 
-# --- Настройки папки ---
-IMAGES_FOLDER = "skin_cancer_images"
+MODEL_DIR = os.getenv("MODEL_DIR", "C:\\Users\\root\\Desktop\\model_skin_trans")
+if not MODEL_DIR:
+    raise RuntimeError("Переменная окружения MODEL_DIR не установлена. Установите MODEL_DIR перед запуском сервиса.")
 
-def handle_image_workflow():
+MODEL_DIR = Path(MODEL_DIR)
+if not MODEL_DIR.exists():
+    raise RuntimeError(f"MODEL_DIR='{MODEL_DIR}' не существует или путь неверен.")
+
+app = FastAPI(title="Prediction Service", version="1.0")
+
+# глобальные объекты модели/процессора
+processor = None
+model = None
+device = "cpu"
+id2label_fn = None
+_model_loaded = False
+
+
+class PredictResponse(BaseModel):
+    label: str
+    index: int
+    confidence: float
+    probabilities: List[float]
+
+
+def _safe_id2label(config):
+    """Возвращает функцию index->label на основе config.id2label"""
+    id2label = getattr(config, "id2label", None)
+    if not id2label:
+        return lambda i: str(i)
+    keys = list(id2label.keys())
+    if len(keys) == 0:
+        return lambda i: str(i)
+    first_key = keys[0]
+    if isinstance(first_key, str):
+        return lambda i: id2label.get(str(i), str(i))
+    return lambda i: id2label.get(i, str(i))
+
+
+@app.on_event("startup")
+def load_model():
+    global processor, model, device, id2label_fn, _model_loaded
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        processor = AutoImageProcessor.from_pretrained(str(MODEL_DIR))
+        model = AutoModelForImageClassification.from_pretrained(str(MODEL_DIR))
+        model.to(device)
+        model.eval()
+        id2label_fn = _safe_id2label(model.config)
+        _model_loaded = True
+        print(f"[startup] Loaded model from {MODEL_DIR} on device {device}")
+    except Exception as e:
+        _model_loaded = False
+        # пробрасываем ошибку, чтобы сервис не стартовал "тихо"
+        raise RuntimeError(f"Не удалось загрузить модель из {MODEL_DIR}: {e}")
+
+
+def read_image_from_bytes(b: bytes) -> Image.Image:
+    try:
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        return img
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не удалось прочитать изображение: {e}")
+
+
+@app.post("/predict", response_model=PredictResponse)
+async def predict(image_file: UploadFile = File(...)):
     """
-    Выполняет полный цикл: 
-    1. Выбирает случайное изображение и загружает его в MinIO.
-    2. Получает загруженное изображение из MinIO.
-    3. Отображает его в отдельном окне.
+    Принимает multipart/form-data с полем image_file и возвращает:
+    {
+      "label": "<строка метки>",
+      "index": <int>,
+      "confidence": <float>,
+      "probabilities": [float,...]
+    }
     """
-    
-    # ------------------------------------
-    # I. Инициализация и выбор файла для загрузки
-    # ------------------------------------
-    try:
-        client = Minio(
-            MINIO_ENDPOINT,
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            secure=MINIO_SECURE
-        )
-    except Exception as e:
-        print(f"Ошибка при инициализации клиента MinIO: {e}"); return
+    if not _model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
 
-    if not os.path.isdir(IMAGES_FOLDER):
-        print(f"Ошибка: Папка '{IMAGES_FOLDER}' не найдена."); return
+    content = await image_file.read()
+    image = read_image_from_bytes(content)
 
-    all_files = os.listdir(IMAGES_FOLDER)
-    image_files = [f for f in all_files if os.path.isfile(os.path.join(IMAGES_FOLDER, f))]
-
-    if not image_files:
-        print(f"В папке '{IMAGES_FOLDER}' нет файлов."); return
-
-    random_filename = random.choice(image_files)
-    file_path = os.path.join(IMAGES_FOLDER, random_filename)
-    # Ключ объекта в MinIO, который мы будем использовать для получения
-    object_name = random_filename
-
-    print(f"Выбран файл для загрузки: {file_path}")
-
-    # ------------------------------------
-    # II. Загрузка в MinIO
-    # ------------------------------------
-    try:
-        # Создаем бакет, если он не существует
-        if not client.bucket_exists(BUCKET_NAME):
-            client.make_bucket(BUCKET_NAME)
-            print(f"Бакет '{BUCKET_NAME}' создан.")
-
-        # Определяем Content-Type
-        content_type = 'image/jpeg' if random_filename.lower().endswith(('.jpg', '.jpeg')) else 'image/png' if random_filename.lower().endswith('.png') else 'application/octet-stream'
-
-        # Загружаем файл
-        client.fput_object(
-            BUCKET_NAME,
-            object_name,
-            file_path,
-            content_type=content_type
-        )
-
-        print("-" * 30)
-        print(f"✅ Успешно загружено: '{object_name}' в бакет '{BUCKET_NAME}'")
-        print("-" * 30)
-
-    except S3Error as err:
-        print(f"Ошибка MinIO при загрузке: {err}"); return
-    except Exception as e:
-        print(f"Произошла непредвиденная ошибка при загрузке: {e}"); return
-
-    # ------------------------------------
-    # III. Получение и отображение
-    # ------------------------------------
-    print(f"--- Получение объекта '{object_name}' из MinIO ---")
-    
-    response = None
-    try:
-        # 1. Скачивание объекта из MinIO
-        response = client.get_object(BUCKET_NAME, object_name)
-        
-        # Чтение байтов изображения
-        image_bytes = response.read()
-
-        # 2. Отображение изображения с помощью Pillow
-        image = Image.open(io.BytesIO(image_bytes))
-        print(f"Размер изображения: {image.size}")
-        # Отображение в отдельном окне
-        image.show(title=f"Изображение из MinIO: {object_name}")
-        
-    except S3Error as err:
-        print(f"Ошибка MinIO при получении объекта: {err}")
-    except Exception as e:
-        print(f"Произошла непредвиденная ошибка при отображении: {e}")
-    finally:
-        # Важно закрыть поток, если он был открыт
-        if response:
-            response.close()
-            response.release_conn()
-
-
-if __name__ == "__main__":
-    handle_image_workflow()
+    # preprocess
+    inputs = processor(images=image, return_tensors="pt")
+    # перенос на устройство
