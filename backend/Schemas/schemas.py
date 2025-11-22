@@ -73,6 +73,7 @@ class ExaminationResponse(BaseModel):
     examination_date: date
     examination_doctor: str
     model_confidence: float
+    final_diagnosis: str
     
     user: UserResponse
     image: ImageResponse

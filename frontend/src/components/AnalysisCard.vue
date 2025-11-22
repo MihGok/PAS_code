@@ -8,8 +8,15 @@
         <img :src="imageUrl" alt="Снимок анализа" class="analysis-image">
         <h4>Результат модели</h4>
         <ul>
-          <li><strong>Результат:</strong> {{ getDiseaseName(localAnalysis.examination_result_model) }} ({{ localAnalysis.examination_result_model }})</li>
-          <li><strong>Уверенность:</strong> {{ (localAnalysis.model_confidence * 100).toFixed(1) }}%</li>
+          <li class="final-diagnosis-row">
+            <strong>Итоговый диагноз:</strong> 
+            <span class="highlight-diagnosis">
+              {{ getDiseaseName(localAnalysis.final_diagnosis) || 'Не определен' }} 
+              ({{ localAnalysis.final_diagnosis || 'N/A' }})
+            </span>
+          </li>
+          <li><strong>Предсказание модели:</strong> {{ getDiseaseName(localAnalysis.examination_result_model) }} ({{ localAnalysis.examination_result_model }})</li>
+          <li><strong>Уверенность модели:</strong> {{ (localAnalysis.model_confidence * 100).toFixed(1) }}%</li>
           <li><strong>Локация:</strong> {{ getLocationName(localAnalysis.examination_location) }} ({{ localAnalysis.examination_location || 'N/A' }})</li>
         </ul>
       </div>
@@ -123,15 +130,17 @@ async function addNewDiagnosis() {
   isAdding.value = true
   addError.value = ''
   try {
-    const response = await axios.post(
+    await axios.post(
       `/api/analysis/${localAnalysis.value.examination_id}/diagnoses/`,
       {
         diagnosis_result: newDiagnosis.diagnosis_result,
         doctor_name: newDiagnosis.doctor_name
       }
     )
-    localAnalysis.value.diagnoses.push(response.data)
+    const refreshResponse = await axios.get(`/api/analysis/${localAnalysis.value.examination_id}/`)
+    localAnalysis.value = refreshResponse.data
     newDiagnosis.doctor_name = ''
+    
   } catch (error) {
     console.error('Ошибка при добавлении диагноза:', error)
     addError.value = 'Не удалось добавить диагноз.'
@@ -257,4 +266,17 @@ li {
   color: #721c24;
   border: 1px solid #f5c6cb;
 }
+
+.final-diagnosis-row {
+  margin-bottom: 12px; /* Отступ от остальных пунктов */
+  font-size: 1.1em;    /* Чуть крупнее шрифт */
+  padding-bottom: 8px;
+  border-bottom: 1px dashed #ccc; /* Разделитель */
+}
+
+.highlight-diagnosis {
+  color: #d9534f; /* Красный оттенок для важности, или зеленый #28a745 */
+  font-weight: bold;
+}
+
 </style>

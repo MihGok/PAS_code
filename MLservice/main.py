@@ -49,6 +49,7 @@ def _safe_id2label(config):
     if len(keys) == 0:
         return lambda i: str(i)
     first_key = keys[0]
+    # Transformers иногда использует '0', '1' (str), а иногда 0, 1 (int)
     if isinstance(first_key, str):
         return lambda i: id2label.get(str(i), str(i))
     return lambda i: id2label.get(i, str(i))
@@ -80,7 +81,7 @@ def read_image_from_bytes(b: bytes) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"Не удалось прочитать изображение: {e}")
 
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict", response_model=PredictResponse,  summary = "Получить предсказание модели для изображения")
 async def predict(image_file: UploadFile = File(...)):
     """
     Принимает multipart/form-data с полем image_file и возвращает:
@@ -99,4 +100,41 @@ async def predict(image_file: UploadFile = File(...)):
 
     # preprocess
     inputs = processor(images=image, return_tensors="pt")
-    # перенос на устройство
+    
+    # 1. Перенос тензоров на нужное устройство (GPU/CPU)
+    inputs = inputs.to(device)
+
+    # 2. Запуск модели в режиме без вычисления градиентов (быстрее)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    # 3. Получение "сырых" результатов (логитов)
+    logits = outputs.logits
+
+    # 4. Преобразование логитов в вероятности (от 0 до 1)
+    probabilities = F.softmax(logits, dim=1)
+    
+    # 5. Получение лучшего предсказания (индекс и значение)
+    confidence_tensor, predicted_index_tensor = torch.max(probabilities, dim=1)
+    
+    # 6. Извлечение значений из тензоров
+    predicted_index = predicted_index_tensor.item()
+    confidence = confidence_tensor.item()
+    
+    # 7. Получение текстовой метки по индексу
+    label = id2label_fn(predicted_index)
+    
+    # 8. Формирование и возврат ответа
+    return PredictResponse(
+        label=label,
+        index=predicted_index,
+        confidence=confidence,
+        # .squeeze() убирает лишнее измерение, .tolist() превращает в список    
+        probabilities=probabilities.squeeze().tolist() 
+    )
+
+# Это нужно, чтобы можно было запустить `python main.py`
+if __name__ == "__main__":
+    import uvicorn
+    # Вы можете добавить --reload для режима отладки
+    uvicorn.run("main:app", host="127.0.0.1", port=8080, reload=True)

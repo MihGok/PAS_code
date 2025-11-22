@@ -14,8 +14,6 @@ from Database.image_storage import minio_service
 
 router = APIRouter()
 
-# --- Зависимости для получения данных из форм ---
-
 async def get_user_data(
     user_id: str = Form(..., description="СНИЛС пациента"),
     user_name: str = Form(..., description="Имя пользователя"),
@@ -30,7 +28,6 @@ async def get_user_data(
     )
 
 async def get_exam_data(
-    # ИЗМЕНЕНИЕ: Теперь принимает только данные БЕЗ результатов модели
     examination_location: str | None = Form(None, max_length=2),
     examination_date: date = Form(date.today()),
     examination_doctor: str = Form(...),
@@ -41,16 +38,17 @@ async def get_exam_data(
         examination_doctor=examination_doctor,
     )
 
+
 async def get_initial_diagnosis_data(
     diagnosis_result: str = Form(..., max_length=50),
-    doctor_name: str = Form(...) # Обычно совпадает с examination_doctor
+    doctor_name: str = Form(...) 
 ) -> schemas.DiagnosisCreate:
     return schemas.DiagnosisCreate(
         diagnosis_result=diagnosis_result,
         doctor_name=doctor_name,
     )
 
-# ----------------- НОВЫЙ ЭНДПОИНТ: АНАЛИЗ ИЗОБРАЖЕНИЯ ------------------
+
 @router.post(
     "/analyze/",
     response_model=schemas.AnalysisPredictionResponse,
@@ -58,18 +56,25 @@ async def get_initial_diagnosis_data(
 )
 async def analyze_image_for_model_prediction(image_file: UploadFile = File(...)):
     """
-    Принимает изображение, запускает модель и возвращает предсказание.
+    Принимает изображение, АСИНХРОННО запускает модель и возвращает предсказание.
     """
     try:
         image_bytes = await image_file.read()
-        # Вызов функции-заглушки для модели
-        prediction_data = analysis_service.run_model_prediction(image_bytes=image_bytes)
+        
+        # ИЗМЕНЕНИЕ: Добавлено 'await', т.к. функция стала асинхронной
+        prediction_data = await analysis_service.run_model_prediction(image_bytes=image_bytes)
+        
         return prediction_data
     except Exception as e:
+        # (Дополнительно) Ловим ошибки httpx, если они "прорвутся"
+        if "RequestError" in str(type(e)):
+            raise HTTPException(status_code=504, detail=f"Ошибка подключения к сервису модели: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка при выполнении анализа: {e}")
 
 
-# ----------------- ОБНОВЛЕННЫЙ ЭНДПОИНТ: СОЗДАНИЕ АНАЛИЗА ------------------
+# ----------------- ЭНДПОИНТ СОЗДАНИЯ АНАЛИЗА (БЕЗ ИЗМЕНЕНИЙ) ------------------
+# Он не вызывает модель, а получает ее результат из формы,
+# поэтому его логика остается СИНХРОННОЙ.
 @router.post(
     "/analysis/",
     response_model=schemas.ExaminationResponse,
@@ -79,25 +84,21 @@ async def create_full_analysis(
     user_data: schemas.UserCreate = Depends(get_user_data),
     exam_data: schemas.ExaminationCreate = Depends(get_exam_data),
     initial_diagnosis_data: schemas.DiagnosisCreate = Depends(get_initial_diagnosis_data),
-    # НОВЫЕ ПОЛЯ ОТ ФРОНТЕНДА: Результат модели, полученный на предыдущем шаге
     examination_result_model: str = Form(..., max_length=50),
     model_confidence: float = Form(...),
     image_file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     try:
-        # Объединяем ExaminationCreate и результаты модели в НОВУЮ схему
         full_exam_data = schemas.ExaminationFullCreate(
             **exam_data.model_dump(),
             examination_result_model=examination_result_model,
-            # Преобразование float в Decimal для БД
             model_confidence=decimal.Decimal(str(model_confidence)) 
         )
         
-        # Чтение файла
         image_bytes = await image_file.read()
 
-        # Выполняем весь цикл, передавая полную схему
+        # Вызываем СИНХРОННУЮ функцию workflow (она работает с БД)
         db_exam = analysis_service.create_full_analysis_workflow(
             db=db,
             user_data=user_data,
@@ -113,23 +114,21 @@ async def create_full_analysis(
              
         return db_exam
     except HTTPException:
-        # Перехват HTTPException (например, 404/500 из crud/service)
         raise
     except Exception as e:
-        # Для 422 - проверяем, что все поля есть в FormData и имеют верные типы
         raise HTTPException(
             status_code=500,
             detail=f"Произошла ошибка при создании анализа: {e}"
         )
 
-# ... (Остальные эндпоинты остаются без изменений) ...
 
-@router.get("/user/{user_id}/examinations/", response_model=list[schemas.ExaminationResponse])
+@router.get("/user/{user_id}/examinations/", response_model=list[schemas.ExaminationResponse], summary='Получить все анализы пользователя')
 def get_user_examinations(user_id: str, db: Session = Depends(get_db)):
     examinations = crud_ops.get_examinations_by_user_id(db, user_id=user_id)
     return examinations
 
-@router.get("/analysis/{analysis_id}/", response_model=schemas.ExaminationResponse)
+
+@router.get("/analysis/{analysis_id}/", response_model=schemas.ExaminationResponse, summary="Получить анализ по ID")
 def get_analysis_by_id(analysis_id: int, db: Session = Depends(get_db)):
     db_exam = crud_ops.get_examination_by_id(db, exam_id=analysis_id)
     if db_exam is None:
@@ -144,7 +143,7 @@ def get_analysis_by_id(analysis_id: int, db: Session = Depends(get_db)):
 )
 def add_new_diagnosis(
     analysis_id: int,
-    diagnosis_data: schemas.DiagnosisCreate, # Принимаем данные для нового диагноза
+    diagnosis_data: schemas.DiagnosisCreate, 
     db: Session = Depends(get_db)
 ):
     db_exam = crud_ops.get_examination_by_id(db, exam_id=analysis_id)
@@ -177,5 +176,5 @@ def get_image_visualization(image_id: int, db: Session = Depends(get_db)):
     
     if presigned_url is None:
         raise HTTPException(status_code=500, detail="Не удалось получить ссылку на изображение")
-    # Перенаправление клиента на временный URL MinIO
+    
     return RedirectResponse(url=presigned_url)

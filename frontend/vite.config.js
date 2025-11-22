@@ -19,8 +19,7 @@ export default defineConfig({
       '/api': {
         // ...будут перенаправлены на ваш FastAPI бэкенд
         target: 'http://127.0.0.1:8000',
-        changeOrigin: true, // необходимо для виртуальных хостов
-        // Мы не переписываем путь, так как /api есть и там, и там
+        changeOrigin: true,
       },
     }
   }
